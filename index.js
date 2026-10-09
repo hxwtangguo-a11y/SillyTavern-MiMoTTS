@@ -303,7 +303,7 @@ export class MiMoTtsProvider {
             <hr>
 
             <label for="mimo_clone_file">声音克隆参考音频（模型填 mimo-v2.5-tts-voiceclone 时生效）：</label>
-            <input id="mimo_clone_file" type="file" accept=".wav,.mp3,.m4a,.ogg,.flac,audio/*" class="text_pole"/>
+            <input id="mimo_clone_file" type="file" class="text_pole"/>
             <small id="mimo_clone_status">尚未选择参考音频</small>
             <div id="mimo_clone_clear" class="menu_button">清除参考音频</div>
             <small>
