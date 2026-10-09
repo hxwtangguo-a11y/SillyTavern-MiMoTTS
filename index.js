@@ -1,5 +1,6 @@
 /**
  * MiMo TTS — 小米 MiMo 语音合成供应商（SillyTavern 第三方扩展）
+ * 本版本在 v0.2.0 基础上增加了「声音克隆」支持（mimo-v2.5-tts-voiceclone）。
  *
  * 关于音频质量的要点（重要，勿轻易改动）：
  *   MiMo 的 /v1/chat/completions 在 stream:true 时，**每个 SSE 数据块都会自带一个
@@ -13,6 +14,12 @@
  *   chunked 分块流式 —— 首音快，但酒馆每块都要"换音源+等 canplay"（0.3~0.5s），
  *                        块间必然有间断，仅作尝鲜。
  *
+ * 声音克隆（本版新增）：
+ *   模型填 mimo-v2.5-tts-voiceclone 后，在设置里选一段参考音频即可。
+ *   参考音频会在浏览器里统一转成 24kHz 单声道 WAV（最长截取 10 秒），
+ *   保存在本机 localStorage，每次请求时以 base64 放进 audio.voice 发给小米。
+ *   克隆模式下一律使用整段播放，Voice Map 里选哪个音色名都无所谓（会被忽略）。
+ *
  * 传输方式：浏览器直连新加坡（无需服务器中转，不需要装任何服务端插件）。
  *
  * 安装位置：data/<user>/extensions/mimo-tts/（在 git 之外，升级酒馆不受影响）
@@ -21,12 +28,16 @@
 import { eventSource, event_types } from '../../../../script.js';
 import { registerTtsProvider, saveTtsProviderSettings } from '../../tts/index.js';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0-clone';
 const PROVIDER_NAME = 'MiMo';
 const MIMO_ENDPOINT = 'https://api.xiaomimimo.com/v1/chat/completions';
 const BYTES_PER_SECOND = 48000; // pcm16 24kHz/16bit 单声道 = 48000 B/s
 const PCM_SAMPLE_RATE = 24000;
 const PREVIEW_TEXT = '你好，我是小米 MiMo 的语音合成，这是一段试听。';
+
+// 声音克隆参考音频：保存在本机 localStorage（不写进酒馆的设置文件，避免设置文件变大）
+const CLONE_STORAGE_KEY = 'mimo_tts_clone_sample';
+const CLONE_MAX_SECONDS = 10;
 
 // ----------------------------------------------------------------------
 //  在途请求的取消（重要）
@@ -72,6 +83,16 @@ function base64ToBytes(b64) {
     return out;
 }
 
+/** Uint8Array → base64（分段处理，避免大数组一次性展开导致栈溢出） */
+function bytesToBase64(bytes) {
+    let bin = '';
+    const step = 0x8000;
+    for (let i = 0; i < bytes.length; i += step) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+    }
+    return btoa(bin);
+}
+
 /** 把若干 Uint8Array 拼成一个 */
 function concatBytes(list) {
     let total = 0;
@@ -114,6 +135,96 @@ function pcm16ToWav(pcm) {
     out.set(new Uint8Array(header), 0);
     out.set(pcm, 44);
     return out;
+}
+
+// ----------------------------------------------------------------------
+//  声音克隆：参考音频的处理与保存
+// ----------------------------------------------------------------------
+
+function isCloneModel(model) {
+    return /voiceclone/i.test(String(model || ''));
+}
+
+/** 读取已保存的参考音频，没有则返回 null */
+function loadCloneSample() {
+    try {
+        const raw = localStorage.getItem(CLONE_STORAGE_KEY);
+        if (!raw) {
+            return null;
+        }
+        const obj = JSON.parse(raw);
+        if (obj && typeof obj.dataUri === 'string' && obj.dataUri.startsWith('data:audio/')) {
+            return obj;
+        }
+    } catch {
+        /* ignore */
+    }
+    return null;
+}
+
+function saveCloneSample(sample) {
+    localStorage.setItem(CLONE_STORAGE_KEY, JSON.stringify(sample));
+}
+
+function clearCloneSample() {
+    try {
+        localStorage.removeItem(CLONE_STORAGE_KEY);
+    } catch {
+        /* ignore */
+    }
+}
+
+/**
+ * 把用户选的音频文件（wav / mp3 / m4a 等，只要浏览器能解码）
+ * 统一转成 24kHz 单声道 16bit WAV，并截取前 CLONE_MAX_SECONDS 秒。
+ * 返回 { name, seconds, dataUri }。
+ */
+async function fileToCloneSample(file) {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!AudioCtx || !OfflineCtx) {
+        throw new Error('当前环境不支持音频解码（缺少 Web Audio）');
+    }
+
+    const arrayBuffer = await file.arrayBuffer();
+
+    const ctx = new AudioCtx();
+    let decoded;
+    try {
+        decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
+    } finally {
+        try {
+            ctx.close();
+        } catch {
+            /* ignore */
+        }
+    }
+
+    const seconds = Math.min(decoded.duration, CLONE_MAX_SECONDS);
+    const length = Math.max(1, Math.floor(seconds * PCM_SAMPLE_RATE));
+
+    // 用离线上下文重采样到 24kHz，并自动混成单声道
+    const offline = new OfflineCtx(1, length, PCM_SAMPLE_RATE);
+    const source = offline.createBufferSource();
+    source.buffer = decoded;
+    source.connect(offline.destination);
+    source.start(0);
+    const rendered = await offline.startRendering();
+
+    const samples = rendered.getChannelData(0);
+    const pcm = new Uint8Array(samples.length * 2);
+    const view = new DataView(pcm.buffer);
+    for (let i = 0; i < samples.length; i++) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+
+    const wav = pcm16ToWav(pcm);
+    return {
+        name: file.name || '参考音频',
+        seconds: samples.length / PCM_SAMPLE_RATE,
+        dataUri: 'data:audio/wav;base64,' + bytesToBase64(wav),
+    };
 }
 
 export class MiMoTtsProvider {
@@ -187,6 +298,18 @@ export class MiMoTtsProvider {
             <label for="mimo_style">风格指令（可留空）：</label>
             <input id="mimo_style" type="text" class="text_pole" maxlength="500" placeholder="例如：用轻快上扬的语调，语速稍快"/>
 
+            <hr>
+
+            <label for="mimo_clone_file">声音克隆参考音频（模型填 mimo-v2.5-tts-voiceclone 时生效）：</label>
+            <input id="mimo_clone_file" type="file" accept="audio/*" class="text_pole"/>
+            <small id="mimo_clone_status">尚未选择参考音频</small>
+            <div id="mimo_clone_clear" class="menu_button">清除参考音频</div>
+            <small>
+                建议选一段 5~10 秒、干净、无背景音乐的人声。选择后会在本机转成 WAV 保存（最多取前 10 秒），
+                每次合成时随请求一起发送给小米。克隆模式下会自动使用整段播放，
+                Voice Map 里选哪个音色名都可以（会被忽略）。请只使用你自己的声音或已获得授权的声音。
+            </small>
+
             <small class="mimo-hint">
                 本扩展由浏览器直接请求小米新加坡的接口，服务器不参与，也不需要装任何服务端组件。<br>
                 音色与角色映射沿用酒馆的 Voice Map，无需在此重复设置。
@@ -247,9 +370,51 @@ export class MiMoTtsProvider {
         bind('#mimo_voices', () => this.onSettingsChange());
         bind('#mimo_style', () => this.onSettingsChange());
 
+        // 声音克隆：选择 / 清除参考音频
+        $('#mimo_clone_file').off('change').on('change', async (event) => {
+            const input = event.target;
+            const file = input.files && input.files[0];
+            await this.onCloneFileChosen(file);
+            input.value = '';
+        });
+        $('#mimo_clone_clear').off('click').on('click', () => {
+            clearCloneSample();
+            this.refreshCloneStatus();
+        });
+        this.refreshCloneStatus();
+
         await this.checkReady();
 
         console.info(`[MiMo TTS] v${VERSION} 设置已加载：${this.settings.play_mode}`);
+    }
+
+    setCloneStatus(text) {
+        $('#mimo_clone_status').text(text);
+    }
+
+    refreshCloneStatus() {
+        const sample = loadCloneSample();
+        if (sample) {
+            this.setCloneStatus(`已保存参考音频：${sample.name}（${Number(sample.seconds).toFixed(1)} 秒）`);
+        } else {
+            this.setCloneStatus('尚未选择参考音频');
+        }
+    }
+
+    async onCloneFileChosen(file) {
+        if (!file) {
+            return;
+        }
+        this.setCloneStatus('正在处理参考音频…');
+        try {
+            const sample = await fileToCloneSample(file);
+            saveCloneSample(sample);
+            this.refreshCloneStatus();
+            console.info(`[MiMo TTS] 参考音频已保存：${sample.name}，${sample.seconds.toFixed(1)} 秒`);
+        } catch (error) {
+            console.error('[MiMo TTS] 处理参考音频失败', error);
+            this.setCloneStatus(`处理失败：${error && error.message ? error.message : error}`);
+        }
     }
 
     onSettingsChange() {
@@ -301,16 +466,13 @@ export class MiMoTtsProvider {
     generateTts(text, voiceId) {
         // 新请求覆盖旧请求：中止上一个仍在途的生成
         const signal = beginGeneration();
-        if (this.settings.play_mode === 'chunked') {
+        // 克隆模式一律走整段播放（克隆接口的流式输出格式未验证）
+        if (this.settings.play_mode === 'chunked' && !isCloneModel(this.settings.model)) {
             return this.chunkedTts(text, voiceId, signal);
         }
         return this.wholeTts(text, voiceId, signal);
     }
 
-    /**
-     * 整段播放：一次请求拿完整音频，只交给播放器一次。
-     * 走非流式接口，拿到单个完整 MP3（音频干净）。
-     */
     /**
      * 把长文本切成适合流水线的批次。
      * 首批小（首音快），之后按几何增长到上限——因为 MiMo 的生成速度约为播放速度的
@@ -381,10 +543,12 @@ export class MiMoTtsProvider {
 
     /**
      * 拿一整段音频，返回原始字节 + MIME。
-     * 直连走非流式接口（单个完整 MP3，仅含 1 个 Xing 头帧，音频干净）；
+     * 直连走非流式接口：普通模型返回单个完整 MP3（仅含 1 个 Xing 头帧，音频干净）；
+     * 克隆模型按官方示例使用 WAV。
      */
     async fetchWholeBytes(text, voiceId, signal) {
-        const response = await this.postDirect(text, voiceId, false, 'mp3', signal);
+        const clone = isCloneModel(this.settings.model);
+        const response = await this.postDirect(text, voiceId, false, clone ? 'wav' : 'mp3', signal);
         if (!response.ok) {
             throw new Error(`MiMo HTTP ${response.status}: ${await response.text()}`);
         }
@@ -398,7 +562,7 @@ export class MiMoTtsProvider {
         if (bytes.length === 0) {
             throw new Error('MiMo 返回的音频数据为空，请检查模型名与音色是否正确');
         }
-        return { bytes, contentType: 'audio/mpeg' };
+        return { bytes, contentType: clone ? 'audio/wav' : 'audio/mpeg' };
     }
 
     /**
@@ -529,14 +693,26 @@ export class MiMoTtsProvider {
             throw new Error('请先在 MiMo 供应商设置里填写 API Key');
         }
 
+        const model = this.settings.model || 'mimo-v2.5-tts';
+        let voice = voiceId;
+
+        // 克隆模式：audio.voice 不是音色名，而是参考音频的 data URI（base64）
+        if (isCloneModel(model)) {
+            const sample = loadCloneSample();
+            if (!sample) {
+                throw new Error('当前模型是声音克隆，请先在 MiMo 设置里选择一段参考音频');
+            }
+            voice = sample.dataUri;
+        }
+
         const style = String(this.settings.style || '').trim();
         const payload = {
-            model: this.settings.model || 'mimo-v2.5-tts',
+            model,
             messages: [
                 { role: 'user', content: style },
                 { role: 'assistant', content: text },
             ],
-            audio: { format: format || 'mp3', voice: voiceId },
+            audio: { format: format || 'mp3', voice },
         };
         if (stream) {
             payload.stream = true;
