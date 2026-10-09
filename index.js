@@ -29,7 +29,7 @@ import { eventSource, event_types } from '../../../../script.js';
 import { registerTtsProvider, saveTtsProviderSettings } from '../../tts/index.js';
 
 const VERSION = '0.3.0-clone';
-const PROVIDER_NAME = 'MiMo';
+const PROVIDER_NAME = 'MiMo-Clone';
 const MIMO_ENDPOINT = 'https://api.xiaomimimo.com/v1/chat/completions';
 const BYTES_PER_SECOND = 48000; // pcm16 24kHz/16bit 单声道 = 48000 B/s
 const PCM_SAMPLE_RATE = 24000;
